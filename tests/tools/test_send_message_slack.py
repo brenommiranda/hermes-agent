@@ -116,6 +116,39 @@ def _standalone_send(monkeypatch):
     return slack_adapter._standalone_send
 
 
+def test_standalone_send_honors_rich_blocks(monkeypatch, _standalone_send):
+    """Standalone/CLI sends must preserve the configured Block Kit renderer."""
+    fake_session = _SlackSession()
+    monkeypatch.setattr(
+        "aiohttp.ClientSession", lambda *args, **kwargs: fake_session
+    )
+
+    message = (
+        "# Status\n\n"
+        "1. first\n"
+        "2. second\n\n"
+        "| Job | State |\n"
+        "|---|---|\n"
+        "| briefing | planned |"
+    )
+    pconfig = SimpleNamespace(
+        enabled=True,
+        token="good-token",
+        extra={"rich_blocks": True},
+    )
+
+    result = asyncio.run(_standalone_send(pconfig, "C123", message))
+
+    assert result["success"] is True
+    payload = fake_session.calls[0][1]
+    assert [block["type"] for block in payload["blocks"]] == [
+        "header",
+        "rich_text",
+        "table",
+    ]
+    assert payload["text"]
+
+
 def test_standalone_send_stops_on_non_token_error(monkeypatch, _standalone_send):
     """Terminal errors (not token-scoped) must not burn the remaining tokens."""
 

@@ -9181,11 +9181,17 @@ async def _standalone_send(
     media_files = media_files or []
     warnings: List[str] = []
 
+    # Keep standalone sends (``hermes send``, cron delivery, out-of-process
+    # send_message) on the same formatting path as the live gateway adapter.
+    # Previously this helper reused only ``format_message`` and silently
+    # discarded ``rich_blocks`` / ``markdown_blocks`` from pconfig.extra.
+    _fmt_adapter = SlackAdapter.__new__(SlackAdapter)
+    _fmt_adapter.config = pconfig
+
     def _format_mrkdwn(text: str) -> str:
         if not text:
             return text
         try:
-            _fmt_adapter = SlackAdapter.__new__(SlackAdapter)
             return _fmt_adapter.format_message(text)
         except Exception:
             logger.debug(
@@ -9194,8 +9200,21 @@ async def _standalone_send(
             )
             return text
 
+    def _format_blocks(text: str) -> Optional[list]:
+        if not text:
+            return None
+        try:
+            return _fmt_adapter._maybe_blocks(text)
+        except Exception:
+            logger.debug(
+                "Failed to apply Slack Block Kit formatting in _standalone_send",
+                exc_info=True,
+            )
+            return None
+
     formatted = _format_mrkdwn(message) if message else message
     formatted_caption = _format_mrkdwn(caption) if caption else caption
+    message_blocks = _format_blocks(message)
 
     # --- Media path: AsyncWebClient.files_upload_v2 (+ optional text) ---
     if media_files:
@@ -9339,6 +9358,8 @@ async def _standalone_send(
             timeout=aiohttp.ClientTimeout(total=30), **_sess_kw
         ) as session:
             payload = {"channel": chat_id, "text": formatted, "mrkdwn": True}
+            if message_blocks:
+                payload["blocks"] = message_blocks
             if thread_id:
                 payload["thread_ts"] = thread_id
             for tok in tokens:
@@ -9350,6 +9371,29 @@ async def _standalone_send(
                     url, headers=headers, json=payload, **_req_kw
                 ) as resp:
                     data = await resp.json()
+
+                # Structured formatting is progressive enhancement. Match the
+                # live adapter's behavior: if this Slack surface rejects the
+                # blocks, retry the same message once as plain mrkdwn before
+                # considering token rotation or returning an error.
+                block_error = data.get("error", "")
+                if (
+                    not data.get("ok")
+                    and payload.get("blocks")
+                    and block_error in {"invalid_blocks", "msg_too_long", "too_many_blocks"}
+                ):
+                    fallback_payload = dict(payload)
+                    fallback_payload.pop("blocks", None)
+                    logger.info(
+                        "[Slack] Standalone Block Kit payload rejected; "
+                        "retrying without blocks: %s",
+                        block_error,
+                    )
+                    async with session.post(
+                        url, headers=headers, json=fallback_payload, **_req_kw
+                    ) as resp:
+                        data = await resp.json()
+
                 if data.get("ok"):
                     return {
                         "success": True,
