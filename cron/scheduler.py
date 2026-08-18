@@ -191,16 +191,49 @@ def _failure_streak_nudge(job: dict) -> str:
     )
 
 
-def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
+def _clean_cron_failure_text(error: str | None) -> str:
+    """Sanitize one real failure without changing which subsystem owns it."""
+    text = (error or "unknown error").strip()
+    cleaned = re.sub(
+        r"^(RuntimeError|Exception|ValueError|HTTPStatusError):\s*",
+        "",
+        text[:2000],
+    )
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if len(cleaned) > 180:
+        cleaned = cleaned[:177].rstrip() + "..."
+    return cleaned or "unknown error"
+
+
+def _verified_cron_output_note(output_file, *, no_agent: bool) -> str:
+    """Cite persisted output only when the exact returned path still exists."""
+    if not output_file:
+        return ""
+    try:
+        path = Path(output_file)
+        if not path.is_file():
+            return ""
+    except (OSError, TypeError, ValueError):
+        return ""
+    label = "Captured script output" if no_agent else "Run output"
+    return f" {label}: `{path}`."
+
+
+def _summarize_cron_failure_for_delivery(
+    job: dict, error: str | None, output_file=None
+) -> str:
     """Return a compact one-line failure message for chat delivery.
 
-    Full details stay in the cron output directory and the logs. Chat should
-    show the operator what broke without dumping provider JSON, retry noise, or
-    stack traces into the delivery channel.
+    Error ownership follows the job mode before any keyword classification.
+    A persisted-output path is cited only when the save operation returned it
+    and the file still exists at delivery time.
     """
     job_name = job.get("name") or job.get("id") or "cron job"
     text = (error or "unknown error").strip()
     lower = text.lower()
+    output_note = _verified_cron_output_note(
+        output_file, no_agent=bool(job.get("no_agent"))
+    )
 
     if "skipped to prevent unintended spend: global inference config drifted" in lower:
         if "finite one-shot job is consumed" in lower:
@@ -220,38 +253,29 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             f"unintended spend. {remediation}"
         )
 
-    # A no_agent job IS its script — run_job short-circuits it before any model
-    # is reached ("no LLM involvement", see the no_agent branch in run_job). So
-    # provider timeouts, rate limits, auth errors and fallback chains are not
-    # merely unlikely for these jobs, they are structurally impossible. Classify
-    # on the job's MODE before pattern-matching its prose.
-    #
-    # Without this gate the branches below classify by substring, so a script's
-    # own wording decides which subsystem gets blamed. _run_job_script reports a
-    # timeout as "Script timed out after {n}s: {path}" — that contains "timed
-    # out", so it matched the provider branch and the operator was told
-    # "provider timeout. Fallback chain was exhausted or unavailable." for a job
-    # that never opened a socket. "429" or "authentication" appearing anywhere
-    # in a script's output misfires the same way.
-    #
-    # A delivery line that names the wrong subsystem is worse than no line at
-    # all: it does not merely fail to inform, it sends the reader to the wrong
-    # place.
-    #
-    # Falling through leaves the generic cleaner below to report what actually
-    # happened, naming the script. No new message text is needed.
-    provider_reachable = not job.get("no_agent")
+    # A no_agent job IS its script — classify by mode before inspecting error
+    # prose. Provider/fallback failures are structurally impossible because the
+    # no_agent branch returns before constructing any model machinery.
+    if job.get("no_agent"):
+        cleaned = _clean_cron_failure_text(text)
+        if cleaned.lower().startswith("script timed out"):
+            cleaned = "script timed out" + cleaned[len("script timed out") :]
+        cleaned = cleaned.rstrip(".")
+        return (
+            f"⚠️ Cron '{job_name}' failed in script: {cleaned}. "
+            f"No model was invoked.{output_note}"
+        )
 
-    # Script execution happens outside the LLM/provider path (also for
-    # agent-backed jobs that run a context script). Check the script runner's
-    # explicit error contract ("Script timed out after {n}s: {path}") before
-    # generic timeout matching so a script timeout never claims a provider
-    # fallback was attempted (#82460 @jbagdonas, #78503 @daxro).
+    # Script execution also precedes the model for agent-backed jobs that use a
+    # context script. Preserve that explicit runner contract before generic
+    # provider-timeout matching.
     if lower.startswith("script timed out"):
         return (
             f"⚠️ Cron '{job_name}' failed: script timed out. "
-            "No model was invoked. Full details saved in cron output."
+            f"No model was invoked.{output_note}"
         )
+
+    provider_reachable = True
 
     # Provider/API failures are the common noisy path. Keep these short.
     # Match 429 as a whole token (#83188 @cation98): bare substring matching
@@ -267,8 +291,8 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             reason = "quota limit"
         return (
             f"⚠️ Cron '{job_name}' failed: provider {reason}. "
-            f"{_fallback_chain_phrase()} "
-            "Full details saved in cron output."
+            f"{_fallback_chain_phrase()}"
+            f"{output_note}"
         )
 
     # The scheduler's own inactivity watchdog (see the TimeoutError raised
@@ -292,7 +316,7 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             f"⚠️ Cron '{job_name}' failed: the job itself stalled — no tool/API "
             "activity for the configured inactivity window. Not a provider or "
             "fallback-chain issue; check what the job was doing when it went "
-            "quiet. Full details saved in cron output."
+            f"quiet.{output_note}"
         )
 
     # Sibling scheduler-side timeout (#79768): the TERMINAL_CWD lock-wait
@@ -306,7 +330,7 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
             "working-directory lock — another cron job (a workdir writer or "
             "long-running readers) held it too long. Not a provider or "
             "fallback-chain issue; stagger the holder's schedule or remove "
-            "its workdir. Full details saved in cron output."
+            f"its workdir.{output_note}"
         )
 
     if provider_reachable and (
@@ -314,8 +338,8 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     ):
         return (
             f"⚠️ Cron '{job_name}' failed: provider timeout. "
-            f"{_fallback_chain_phrase()} "
-            "Full details saved in cron output."
+            f"{_fallback_chain_phrase()}"
+            f"{output_note}"
         )
 
     # Match authentication/authorization wording at a word boundary and the
@@ -324,22 +348,13 @@ def _summarize_cron_failure_for_delivery(job: dict, error: str | None) -> str:
     if provider_reachable and (
         re.search(r"authenticat|authoriz", lower) or re.search(r"\b(401|403)\b", text)
     ):
-        return (
-            f"⚠️ Cron '{job_name}' failed: provider authentication error. "
-            "Full details saved in cron output."
-        )
+        return f"⚠️ Cron '{job_name}' failed: provider authentication error.{output_note}"
 
     # Strip common exception wrappers and collapse provider payloads. Bound
     # the input first so a multi-KB provider blob cannot slow the
     # substitutions.
-    cleaned = re.sub(
-        r"^(RuntimeError|Exception|ValueError|HTTPStatusError):\s*",
-        "", text[:2000],
-    )
-    cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    if len(cleaned) > 180:
-        cleaned = cleaned[:177].rstrip() + "..."
-    return f"⚠️ Cron '{job_name}' failed: {cleaned}"
+    cleaned = _clean_cron_failure_text(text)
+    return f"⚠️ Cron '{job_name}' failed: {cleaned}{output_note}"
 
 
 class CronPromptInjectionBlocked(Exception):
@@ -6418,7 +6433,9 @@ def _run_one_job_body(
                 )
             else:
                 deliver_content = final_response if success else (
-                    _summarize_cron_failure_for_delivery(job, error)
+                    _summarize_cron_failure_for_delivery(
+                        job, error, output_file=output_file
+                    )
                     + _failure_streak_nudge(job)
                 )
                 if drift_skip and not success:

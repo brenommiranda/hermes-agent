@@ -199,8 +199,13 @@ def test_timed_out_no_agent_script_delivery_is_not_mislabeled_as_provider_failur
     assert scheduler.run_one_job(job) is True
     assert len(delivered) == 1
     assert "script timed out" in delivered[0].lower()
+    assert "failed in script:" in delivered[0]
+    assert "No model was invoked" in delivered[0]
     assert "provider" not in delivered[0].lower()
     assert "fallback" not in delivered[0].lower()
+    assert "Captured script output:" in delivered[0]
+    cited_path = pathlib.Path(delivered[0].split("`")[1])
+    assert cited_path.is_file()
 
 
 def test_agent_provider_timeout_delivery_keeps_fallback_guidance(hermes_env, monkeypatch):
